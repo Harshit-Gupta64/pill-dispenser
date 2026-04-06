@@ -18,19 +18,20 @@ const STATES = {
 };
 
 const CONFIG = {
-  DOSE_WINDOW_MS:        15 * 60 * 1000,  // 15 min real
-  JAM_DETECT_MS:         30  * 1000,        // 30 sec real
+  DOSE_WINDOW_MS:        30 * 1000,       // 15 min real
+  JAM_DETECT_MS:         30 * 1000,       // 60 sec real
   ESCALATE_AFTER_MISSED: 3,
   LOW_REFILL_GRAMS:      2,
   NOISE_THRESHOLD_GRAMS: 0.5,
 };
 
-function createCompartment(id, scheduledTimes = []) {
+function createCompartment(id, scheduledTimes = [], onEvent = null) {
   let state           = STATES.IDLE;
   let missedStreak    = 0;
   let lastWeight      = null;
   let weightStableAt  = null;   // timestamp when weight last changed
   let windowTimer     = null;   // clearTimeout handle for dose window
+  let jamTimer        = null;   // clearTimeout handle for jam detection while pending
   let eventLog        = [];     // append-only, never mutated
   let seqId           = 0;      // monotonic sequence for dedup / ordering
   let lastEventKey    = null;   // dedup guard: block identical event within 1s
@@ -66,24 +67,55 @@ function createCompartment(id, scheduledTimes = []) {
     if (windowTimer) { clearTimeout(windowTimer); windowTimer = null; }
   }
 
+  function clearJamTimer() {
+    if (jamTimer) { clearTimeout(jamTimer); jamTimer = null; }
+  }
+
+  function resetPendingTracking() {
+    weightStableAt = null;
+    clearJamTimer();
+  }
+
+  function emitAsync(type, extra = {}) {
+    const event = emit(type, extra);
+    if (event && typeof onEvent === 'function') onEvent(event);
+    return event;
+  }
+
+  function startPendingJamTimer() {
+    clearJamTimer();
+    jamTimer = setTimeout(() => {
+      if (state !== STATES.PENDING) return;
+      clearWindow();
+      transition(STATES.JAM);
+      emitAsync('PILL_JAM', { weight: lastWeight });
+      clearJamTimer();
+    }, CONFIG.JAM_DETECT_MS);
+  }
+
   // ── public API ────────────────────────────────────────────────────────────
 
   // Called by cron/scheduler when a dose is due
   function scheduleDose() {
     if (state !== STATES.IDLE) return null;   // already active
+    clearWindow();
+    resetPendingTracking();
     transition(STATES.SCHEDULED);
     const evt = emit('DOSE_SCHEDULED');
 
     // Start the 15-min window. If no IR fires → MISSED
     windowTimer = setTimeout(() => {
-      if (state === STATES.SCHEDULED || state === STATES.PENDING) {
+      // Once IR moves state to PENDING, this timeout must not mark missed.
+      if (state === STATES.SCHEDULED) {
+        clearWindow();
+        resetPendingTracking();
         transition(STATES.MISSED);
         missedStreak++;
-        const missed = emit('DOSE_MISSED', { missedStreak });
+        emitAsync('DOSE_MISSED', { missedStreak });
 
         if (missedStreak >= CONFIG.ESCALATE_AFTER_MISSED) {
           transition(STATES.ESCALATED);
-          emit('DOSE_ESCALATED', { missedStreak });
+          emitAsync('DOSE_ESCALATED', { missedStreak });
         }
         // Automatically return to IDLE for next cycle
         setTimeout(() => { transition(STATES.IDLE); }, 500);
@@ -93,8 +125,7 @@ function createCompartment(id, scheduledTimes = []) {
     return evt;
   }
 
-// In onWeightReading(), replace the entire function with this:
-function onWeightReading(grams) {
+  function onWeightReading(grams) {
     const events = [];
     const previousWeight = lastWeight;  // capture BEFORE any mutation
 
@@ -107,10 +138,13 @@ function onWeightReading(grams) {
         const now = Date.now();
         if (!weightStableAt) weightStableAt = now;
         else if (now - weightStableAt > CONFIG.JAM_DETECT_MS) {
+          // Keep fallback for compatibility if jam timer is disabled.
+          clearWindow();
           transition(STATES.JAM);
           const e = emit('PILL_JAM', { weight: grams });
           if (e) events.push(e);
           weightStableAt = null;
+          clearJamTimer();
         }
       }
       return events;  // weight unchanged, nothing else to do
@@ -123,6 +157,7 @@ function onWeightReading(grams) {
     // Pill dispensed: weight drops while PENDING
     if (state === STATES.PENDING && previousWeight !== null && grams < previousWeight) {
       clearWindow();
+      resetPendingTracking();
       missedStreak = 0;
       transition(STATES.DISPENSED);
       const e = emit('DOSE_DISPENSED', { weight: grams });
@@ -144,7 +179,7 @@ function onWeightReading(grams) {
     }
 
     return events;
-}
+  }
 
   // Called when IR sensor fires (patient hand near compartment)
   function onIRDetected(detectedCompartmentId) {
@@ -168,7 +203,10 @@ function onWeightReading(grams) {
 
     // Correct compartment
     if (state === STATES.SCHEDULED) {
+      clearWindow(); // Once patient reaches compartment, missed-dose window is no longer applicable.
+      resetPendingTracking();
       transition(STATES.PENDING);
+      startPendingJamTimer();
       return emit('PATIENT_REACHED', { compartment: id });
     }
 
@@ -188,18 +226,28 @@ function onWeightReading(grams) {
   // Called when jar is physically cleared
   function onJamCleared() {
     if (state !== STATES.JAM) return null;
+    resetPendingTracking();
     transition(STATES.PENDING);
+    startPendingJamTimer();
     return emit('JAM_CLEARED');
   }
 
   // Called when compartment is refilled (weight jumps significantly)
   function onRefill(newWeight) {
     lastWeight = newWeight;
+    resetPendingTracking();
     if (state === STATES.LOW_REFILL || state === STATES.IDLE) {
       transition(STATES.IDLE);
       return emit('REFILL_CONFIRMED', { weight: newWeight });
     }
     return null;
+  }
+
+  // Force baseline sensor weight without triggering dispense logic.
+  function syncWeight(newWeight) {
+    lastWeight = newWeight;
+    weightStableAt = null;
+    return emit('WEIGHT_SYNCED', { weight: newWeight });
   }
 
   // Snapshot for persistence / reconnect replay
@@ -226,6 +274,7 @@ function onWeightReading(grams) {
     onAck,
     onJamCleared,
     onRefill,
+    syncWeight,
     getSnapshot,
     getLog:         () => [...eventLog],
   };

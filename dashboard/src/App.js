@@ -38,11 +38,12 @@ const ALERT_SEVERITY = {
 function App() {
   const {
     connected, sensorTicks, events, alerts,
-    ackAlert, snoozeAlert, scheduleDose, simulateIR, simulateWeight,
+    ackAlert, snoozeAlert, scheduleDose, simulateIR, simulateWeight, simulatePillTaken, clearJam
   } = useWebSocket();
 
   const [selectedComp, setSelectedComp] = useState('A');
   const [weightInput,  setWeightInput]  = useState(20);
+  const [takeAmount,   setTakeAmount]   = useState(15);
 
   // useRef so React never freezes it
   const weightHistoryRef = useRef({});
@@ -62,8 +63,11 @@ function App() {
 
   const activeAlerts  = alerts.filter(a => !a.snoozed);
   const snoozedAlerts = alerts.filter(a =>  a.snoozed);
+  
+  
 
   return (
+    
     <div style={{ fontFamily: 'sans-serif', padding: '20px', maxWidth: '1100px', margin: '0 auto' }}>
 
       {/* Header */}
@@ -176,14 +180,25 @@ function App() {
             Set weight
           </button>
 
+          <input
+            type="number" value={takeAmount} min={0} max={100}
+            onChange={e => setTakeAmount(Number(e.target.value))}
+            style={{ width: '90px', padding: '6px 8px', borderRadius: '6px', border: '0.5px solid #ccc', fontSize: '13px' }}
+            placeholder="Take g"
+          />
+
           {/* ADD THIS RIGHT HERE */}
           <button onClick={() => {
-            simulateWeight(selectedComp, 15);
-            setTimeout(() => simulateWeight(selectedComp, 5), 500);
+              const gramsToTake = Number.isFinite(takeAmount) ? Math.max(0, takeAmount) : 0;
+              simulatePillTaken(selectedComp, gramsToTake);
           }}
             style={{ padding: '6px 14px', borderRadius: '6px', border: '0.5px solid #1D9E75', color: '#1D9E75', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>
             Simulate pill taken
           </button>
+         <button onClick={() => clearJam(selectedComp)}
+          style={{ padding: '6px 14px', borderRadius: '6px', border: '0.5px solid #D85A30', color: '#D85A30', background: '#fff', cursor: 'pointer', fontSize: '13px' }}>
+          Clear jam
+        </button>
         </div>
       </div>
 
@@ -217,11 +232,11 @@ function App() {
                     </span>
                   </div>
                   <div style={{ display: 'flex', gap: '8px' }}>
-                    <button onClick={() => snoozeAlert(a.seq, a.compartment)}
+                    <button onClick={() => snoozeAlert(a.seq ?? a.seq_id, a.compartment, a.ts)}
                       style={{ padding: '4px 12px', borderRadius: '6px', border: '0.5px solid #ccc', background: '#fff', cursor: 'pointer', fontSize: '12px' }}>
                       Snooze
                     </button>
-                    <button onClick={() => ackAlert(a.seq, a.compartment)}
+                    <button onClick={() => ackAlert(a.seq ?? a.seq_id, a.compartment, a.ts)}
                       style={{ padding: '4px 12px', borderRadius: '6px', border: '0.5px solid #639922', color: '#639922', background: '#fff', cursor: 'pointer', fontSize: '12px' }}>
                       Acknowledge
                     </button>

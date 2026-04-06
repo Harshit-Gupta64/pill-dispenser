@@ -4,12 +4,38 @@
 
 'use strict';
 
+const http = require('http');
 const WebSocket = require('ws');
 const { createCompartment, STATES, CONFIG } = require('./stateMachine');
 const db = require('./db');
 
 const PORT = 8080;
-const wss  = new WebSocket.Server({ port: PORT });
+const httpServer = http.createServer();
+const wss = new WebSocket.Server({ server: httpServer });
+
+httpServer.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[server] Port ${PORT} is already in use. Stop the previous server process, then retry.`);
+    process.exit(1);
+    return;
+  }
+  console.error('[server] Failed to start:', err.message);
+  process.exit(1);
+});
+
+wss.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[server] Port ${PORT} is already in use. Stop the previous server process, then retry.`);
+    process.exit(1);
+    return;
+  }
+  console.error('[ws] Server error:', err.message);
+  process.exit(1);
+});
+
+httpServer.listen(PORT, () => {
+  console.log(`WebSocket server running on ws://localhost:${PORT}`);
+});
 
 // ── Setup: 7 compartments A–G, each its own state machine instance ─────────
 
@@ -17,10 +43,8 @@ const COMPARTMENT_IDS = ['A', 'B', 'C', 'D', 'E', 'F', 'G'];
 const compartments    = {};
 
 COMPARTMENT_IDS.forEach(id => {
-  compartments[id] = createCompartment(id);
+  compartments[id] = createCompartment(id, [], handleEvent);
 });
-
-console.log(`WebSocket server running on ws://localhost:${PORT}`);
 
 // ── Broadcast to all connected dashboard clients ───────────────────────────
 
@@ -109,30 +133,32 @@ wss.on('connection', (ws) => {
 
       // Caregiver acknowledged an alert
       case 'ACK': {
-        const { seqId, compartment } = msg;
+        const { seqId, compartment, alertTs } = msg;
         const comp = compartments[compartment];
         if (!comp) break;
         const event = comp.onAck(seqId);
-        db.resolveAlertBySeq(seqId, compartment);
+        db.resolveAlertBySeq(seqId, compartment, alertTs);
         handleEvent(event);
         break;
       }
 
       // Caregiver snoozed an alert — server holds the timer
       case 'SNOOZE': {
-        const { seqId, compartment, durationMs = 300000 } = msg;
+        const { seqId, compartment, alertTs, durationMs = 300000 } = msg;
         console.log(`[snooze] compartment ${compartment} seq ${seqId} for ${durationMs}ms`);
-        broadcast({ type: 'SNOOZED', data: { seqId, compartment, durationMs } });
+        broadcast({ type: 'SNOOZED', data: { seqId, compartment, alertTs, durationMs } });
 
         // Re-broadcast the alert after snooze expires
         setTimeout(() => {
           const unresolved = db.getUnresolved();
           const still = unresolved.find(a =>
-            a.seq_id === seqId && a.compartment === compartment
+            a.seq_id === seqId &&
+            a.compartment === compartment &&
+            (alertTs == null || a.ts === alertTs)
           );
           if (still) {
             console.log(`[snooze] expired for compartment ${compartment}`);
-            broadcast({ type: 'SNOOZE_EXPIRED', data: { seqId, compartment } });
+            broadcast({ type: 'SNOOZE_EXPIRED', data: { seqId, compartment, alertTs } });
           }
         }, durationMs);
         break;
@@ -155,8 +181,26 @@ wss.on('connection', (ws) => {
 
       // Dashboard simulates weight change (for testing)
       case 'SIMULATE_WEIGHT': {
+        const comp = compartments[msg.compartment];
+        if (!comp) break;
         simulatedWeights[msg.compartment] = msg.weight;
+        // Sync baseline so "Set weight" does not accidentally look like a dispense.
+        handleEvent(comp.syncWeight(msg.weight));
         console.log(`[sim] compartment ${msg.compartment} weight set to ${msg.weight}g`);
+        break;
+      }
+
+      // Dashboard simulates pill removal by grams (for testing)
+      case 'SIMULATE_PILL_TAKEN': {
+        const comp = compartments[msg.compartment];
+        if (!comp) break;
+
+        const gramsToTake = Math.max(0, Number(msg.grams) || 0);
+        const current = simulatedWeights[msg.compartment] ?? 0;
+        const nextWeight = Math.max(0, Number((current - gramsToTake).toFixed(2)));
+
+        simulatedWeights[msg.compartment] = nextWeight;
+        console.log(`[sim] compartment ${msg.compartment} pill taken ${gramsToTake}g, new weight ${nextWeight}g`);
         break;
       }
 

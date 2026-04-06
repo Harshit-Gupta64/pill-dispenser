@@ -49,6 +49,12 @@ const resolveAlert = db.prepare(`
   WHERE seq_id = @seq_id AND compartment = @compartment
 `);
 
+const resolveAlertExact = db.prepare(`
+  UPDATE alert_queue
+  SET resolved = 1, resolved_ts = @resolved_ts
+  WHERE seq_id = @seq_id AND compartment = @compartment AND ts = @ts
+`);
+
 const getUnresolvedAlerts = db.prepare(`
   SELECT * FROM alert_queue
   WHERE resolved = 0
@@ -92,12 +98,20 @@ function saveEvent(event) {
   }
 }
 
-function resolveAlertBySeq(seqId, compartment) {
-  resolveAlert.run({
+function resolveAlertBySeq(seqId, compartment, ts = null) {
+  const payload = {
     seq_id:      seqId,
     compartment,
     resolved_ts: Date.now(),
-  });
+    ts,
+  };
+
+  if (ts != null) {
+    resolveAlertExact.run(payload);
+    return;
+  }
+
+  resolveAlert.run(payload);
 }
 
 function getUnresolved() {
